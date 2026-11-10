@@ -3,12 +3,22 @@ import AVFoundation
 import CoreAudio
 import CoreMediaIO
 import CoreGraphics
+import Network
 
-// Runnable without Xcode: same overlay + CoreAudio/CoreMediaIO detection as the forked app.
-// Build: swiftc -O -framework AppKit -framework AVFoundation -framework CoreAudio -framework CoreMediaIO -framework CoreGraphics -o live-tint main.swift
-// Quit: pkill -f live-tint
+// Runnable without Xcode: overlay + mic/cam + optional Meet/Teams mute bridge.
+// Build:
+//   swiftc -O -framework AppKit -framework AVFoundation -framework CoreAudio \
+//     -framework CoreMediaIO -framework CoreGraphics -framework Network \
+//     -o live-tint MuteBridge.swift main.swift
+// Chrome extension (Meet / Teams web mute): ../mute-bridge-extension/
+// Quit: status menu → Quit
 
-enum MenuBarTintColor { case off, orange, green }
+enum MenuBarTintColor {
+    case off
+    case orange // mic live (unmuted or mute unknown)
+    case muted  // mic held but meeting app reports muted
+    case green  // camera (wins over mic)
+}
 
 /// Height is dynamic + per-screen: frame.maxY - visibleFrame.maxY (live menu-bar band).
 final class MenuBarTintOverlay {
@@ -57,6 +67,7 @@ final class MenuBarTintOverlay {
         switch color {
         case .off: return .clear
         case .orange: return NSColor.systemOrange.withAlphaComponent(alpha)
+        case .muted: return NSColor.systemYellow.withAlphaComponent(min(alpha, 0.35))
         case .green: return NSColor.systemGreen.withAlphaComponent(alpha)
         }
     }
@@ -233,12 +244,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         MenuBarTintOverlay.shared.start()
+        MuteBridge.shared.onChange = { [weak self] in self?.refreshTint() }
+        MuteBridge.shared.start()
 
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.title = "🎙"
-        item.button?.toolTip = "live-tint — mic→orange, cam→green"
+        item.button?.toolTip = "live-tint — mic orange / muted yellow / cam green"
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Flash test (orange)", action: #selector(flashTest), keyEquivalent: "t"))
+        menu.addItem(NSMenuItem(title: "Simulate muted (yellow)", action: #selector(flashMuted), keyEquivalent: "m"))
         menu.addItem(NSMenuItem(title: "Quit live-tint", action: #selector(quit), keyEquivalent: "q"))
         item.menu = menu
         statusItem = item
@@ -251,6 +265,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Listeners can miss transitions; poll as a safety net.
         pollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            MuteBridge.shared.sweepStale()
             self?.refreshTint()
         }
         if let pollTimer { RunLoop.main.add(pollTimer, forMode: .common) }
@@ -262,12 +277,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.refreshTint()
         }
 
-        fputs("live-tint running — flash orange 1.5s, then mic/cam. Menu: Flash test / Quit.\n", stderr)
+        fputs("live-tint running — orange=live mic, yellow=muted (extension), green=cam.\n", stderr)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         pollTimer?.invalidate()
         if let activity { ProcessInfo.processInfo.endActivity(activity) }
+        MuteBridge.shared.stop()
         MenuBarTintOverlay.shared.stop()
         monitors.values.forEach { $0.stopMonitoring() }
         monitors.removeAll()
@@ -278,6 +294,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func flashTest() {
         MenuBarTintOverlay.shared.apply(.orange)
         statusItem?.button?.title = "🟠"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.refreshTint()
+        }
+    }
+
+    @objc private func flashMuted() {
+        MenuBarTintOverlay.shared.apply(.muted)
+        statusItem?.button?.title = "🟡"
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             self?.refreshTint()
         }
@@ -327,17 +351,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             next = .green
             statusItem?.button?.title = "🟢"
         } else if mic {
-            next = .orange
-            statusItem?.button?.title = "🟠"
+            // In-app mute only when the extension (or simulator) says so.
+            if MuteBridge.shared.isMuted == true {
+                next = .muted
+                statusItem?.button?.title = "🟡"
+            } else {
+                next = .orange
+                statusItem?.button?.title = "🟠"
+            }
         } else {
             next = .off
             statusItem?.button?.title = "🎙"
         }
         if next != lastReported {
             lastReported = next
+            var line = "state=\(next)"
             if !activeNames.isEmpty {
-                fputs("active: \(activeNames.joined(separator: ", "))\n", stderr)
+                line += " devices=[\(activeNames.joined(separator: ", "))]"
             }
+            if MuteBridge.shared.isMuted != nil {
+                line += " mute=\(MuteBridge.shared.isMuted!) src=\(MuteBridge.shared.source)"
+            }
+            fputs(line + "\n", stderr)
         }
         MenuBarTintOverlay.shared.apply(next)
     }

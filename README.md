@@ -22,9 +22,15 @@ Adds a **semi-transparent click-through menu-bar tint**: mic → orange, camera 
 
 ```bash
 cd Tools/live-tint
-swiftc -O -framework AppKit -framework AVFoundation -framework CoreAudio -framework CoreMediaIO -framework CoreGraphics -o live-tint main.swift
+swiftc -O -framework AppKit -framework AVFoundation -framework CoreAudio \
+  -framework CoreMediaIO -framework CoreGraphics -framework Network \
+  -o live-tint MuteBridge.swift main.swift
 ./live-tint
 ```
+
+Colors: mic live → orange · mic muted (Meet/Teams web) → yellow · camera → green.
+
+**Mute bridge (browser):** CoreAudio cannot see in-app mute. Load `Tools/mute-bridge-extension` as an unpacked Chrome/Edge extension, keep `live-tint` running. It POSTs mute state to `127.0.0.1:17384`. Native Teams desktop mute is not covered yet.
 
 Quit from the `🎙` status item menu. Full app still needs Xcode to build `In Meeting.xcodeproj`.
 

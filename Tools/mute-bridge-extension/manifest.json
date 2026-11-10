@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "live-tint mute bridge",
+  "version": "1.0.0",
+  "description": "Sends Google Meet / Teams-in-browser mute state to local live-tint (127.0.0.1:17384).",
+  "permissions": [],
+  "host_permissions": [
+    "http://127.0.0.1:17384/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://meet.google.com/*",
+        "https://teams.microsoft.com/*",
+        "https://teams.live.com/*",
+        "https://*.teams.microsoft.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ]
+}

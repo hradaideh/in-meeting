@@ -166,8 +166,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setupObservers()
         discoverAndMonitorDevices()
         
-        // 6. Menu-bar tint overlay (click-through; mic→orange, cam→green)
+        // 6. Menu-bar tint overlay (click-through; mic→orange, muted→yellow, cam→green)
         MenuBarTintOverlay.shared.start()
+        MuteBridge.shared.onChange = { [weak self] in
+            DispatchQueue.main.async { self?.updateMenuBarTint() }
+        }
+        MuteBridge.shared.start()
         
         // 7. Update visual icon state, status file, and tint
         updateMeetingStatus()
@@ -198,8 +202,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateMenuBarTint()
     }
 
-    /// Mic only → orange; camera (or both) → green; idle/paused → off.
+    /// Mic live → orange; mic muted (extension) → yellow; camera → green; idle/paused → off.
     func updateMenuBarTint() {
+        MuteBridge.shared.sweepStale()
         guard !SettingsManager.shared.isPaused else {
             MenuBarTintOverlay.shared.apply(.off)
             return
@@ -220,7 +225,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if cam {
             MenuBarTintOverlay.shared.apply(.green)
         } else if mic {
-            MenuBarTintOverlay.shared.apply(.orange)
+            if MuteBridge.shared.isMuted == true {
+                MenuBarTintOverlay.shared.apply(.muted)
+            } else {
+                MenuBarTintOverlay.shared.apply(.orange)
+            }
         } else {
             MenuBarTintOverlay.shared.apply(.off)
         }
@@ -370,6 +379,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ aNotification: Notification) {
+        MuteBridge.shared.stop()
         MenuBarTintOverlay.shared.stop()
         StatusFileManager.shared.cleanup()
         for monitor in activeMonitors.values {

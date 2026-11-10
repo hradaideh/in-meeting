@@ -7,7 +7,8 @@ import CoreGraphics
 /// so auto-hide / fullscreen / resolution shifts track without a fixed drip.
 enum MenuBarTintColor {
     case off
-    case orange // microphone
+    case orange // microphone live (unmuted / unknown)
+    case muted  // microphone held but meeting app muted
     case green  // camera (or both)
 }
 
@@ -74,6 +75,7 @@ final class MenuBarTintOverlay {
         switch color {
         case .off: return .clear
         case .orange: return NSColor.systemOrange.withAlphaComponent(alpha)
+        case .muted: return NSColor.systemYellow.withAlphaComponent(min(alpha, 0.35))
         case .green: return NSColor.systemGreen.withAlphaComponent(alpha)
         }
     }
