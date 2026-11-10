@@ -3,31 +3,38 @@ import AVFoundation
 import CoreAudio
 import CoreMediaIO
 import CoreGraphics
-import Network
 
-// Runnable without Xcode: overlay + mic/cam + optional Meet/Teams mute bridge.
+// Expandable mic-level menu bar (plan: mic_input_activity_tint).
 // Build:
 //   swiftc -O -framework AppKit -framework AVFoundation -framework CoreAudio \
-//     -framework CoreMediaIO -framework CoreGraphics -framework Network \
-//     -o live-tint MuteBridge.swift main.swift
-// Chrome extension (Meet / Teams web mute): ../mute-bridge-extension/
+//     -framework CoreMediaIO -framework CoreGraphics \
+//     -o live-tint MicLevelMonitor.swift main.swift
 // Quit: status menu → Quit
 
-enum MenuBarTintColor {
-    case off
-    case orange // mic live (unmuted or mute unknown)
-    case muted  // mic held but meeting app reports muted
-    case green  // camera (wins over mic)
+enum OverlayBackground {
+    case clear
+    case orange // mic open
+    case green  // camera on (wins backdrop)
 }
 
-/// Height is dynamic + per-screen: frame.maxY - visibleFrame.maxY (live menu-bar band).
+/// Height is dynamic + per-screen: frame.maxY - visibleFrame.maxY.
 final class MenuBarTintOverlay {
     static let shared = MenuBarTintOverlay()
-    var alpha: CGFloat = 0.45
+
+    var backgroundAlpha: CGFloat = 0.40
+    var meterAlpha: CGFloat = 0.85
+    var stubWidth: CGFloat = 32
+    /// Max meter width as a fraction of the bar.
+    var maxMeterFraction: CGFloat = 0.70
+    /// Curve on level so quiet speech still moves the bar a bit.
+    var levelCurve: CGFloat = 0.65
+
     private var panelsByScreenID: [CGDirectDisplayID: NSPanel] = [:]
-    private var viewsByScreenID: [CGDirectDisplayID: TintView] = [:]
+    private var viewsByScreenID: [CGDirectDisplayID: MeterBarView] = [:]
     private var lastGeometryKey = ""
-    private var current: MenuBarTintColor = .off
+    private var background: OverlayBackground = .clear
+    private var showMeter = false
+    private var level: CGFloat = 0
     private var heightTimer: Timer?
 
     func start() {
@@ -45,34 +52,51 @@ final class MenuBarTintOverlay {
     func stop() {
         heightTimer?.invalidate()
         heightTimer = nil
-        apply(.off)
+        apply(background: .clear, showMeter: false, level: 0)
         panelsByScreenID.values.forEach { $0.orderOut(nil) }
         panelsByScreenID.removeAll()
         viewsByScreenID.removeAll()
         lastGeometryKey = ""
     }
 
-    func apply(_ color: MenuBarTintColor) {
-        current = color
+    func apply(background: OverlayBackground, showMeter: Bool, level: CGFloat) {
+        self.background = background
+        self.showMeter = showMeter
+        self.level = max(0, min(1, level))
         syncGeometryIfNeeded(force: panelsByScreenID.isEmpty)
-        let fill = fillColor(for: color)
-        viewsByScreenID.values.forEach { $0.fillColor = fill }
-        // Always keep panels ordered front (even when clear) so AppKit doesn't
-        // auto-terminate the accessory process for "no windows open".
+        pushVisuals()
         panelsByScreenID.values.forEach { $0.orderFrontRegardless() }
-        fputs("tint=\(color)\n", stderr)
     }
 
-    private func fillColor(for color: MenuBarTintColor) -> NSColor {
-        switch color {
-        case .off: return .clear
-        case .orange: return NSColor.systemOrange.withAlphaComponent(alpha)
-        case .muted: return NSColor.systemYellow.withAlphaComponent(min(alpha, 0.35))
-        case .green: return NSColor.systemGreen.withAlphaComponent(alpha)
+    func setLevel(_ level: CGFloat) {
+        self.level = max(0, min(1, level))
+        for view in viewsByScreenID.values {
+            view.level = self.level
         }
     }
 
-    private var level: NSWindow.Level {
+    private func pushVisuals() {
+        let bg = backgroundColor()
+        for view in viewsByScreenID.values {
+            view.backgroundFill = bg
+            view.showMeter = showMeter
+            view.level = level
+            view.stubWidth = stubWidth
+            view.maxMeterFraction = maxMeterFraction
+            view.levelCurve = levelCurve
+            view.meterFill = NSColor.systemRed.withAlphaComponent(meterAlpha)
+        }
+    }
+
+    private func backgroundColor() -> NSColor {
+        switch background {
+        case .clear: return .clear
+        case .orange: return NSColor.systemOrange.withAlphaComponent(backgroundAlpha)
+        case .green: return NSColor.systemGreen.withAlphaComponent(backgroundAlpha)
+        }
+    }
+
+    private var windowLevel: NSWindow.Level {
         NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.mainMenuWindow)) + 2)
     }
 
@@ -84,7 +108,6 @@ final class MenuBarTintOverlay {
             let frame = screen.frame
             let visible = screen.visibleFrame
             let barH = frame.maxY - visible.maxY
-            // Per screen: only paint where macOS currently reserves a menu bar.
             guard barH > 0.5 else { continue }
             let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID ?? 0
             let rect = NSRect(x: frame.minX, y: frame.maxY - barH, width: frame.width, height: barH)
@@ -93,7 +116,10 @@ final class MenuBarTintOverlay {
         let key = bands.map { id, r, h in
             String(format: "%u:%.1f,%.1f,%.1fx%.1f", id, r.minX, r.minY, r.width, h)
         }.joined(separator: "|")
-        guard force || key != lastGeometryKey else { return }
+        guard force || key != lastGeometryKey else {
+            pushVisuals()
+            return
+        }
         lastGeometryKey = key
 
         let active = Set(bands.map(\.0))
@@ -103,39 +129,64 @@ final class MenuBarTintOverlay {
             viewsByScreenID.removeValue(forKey: id)
         }
 
-        let fill = fillColor(for: current)
         for (id, rect, barH) in bands {
             fputs(String(format: "menubar screen=%u height=%.1f\n", id, barH), stderr)
             if let panel = panelsByScreenID[id] {
                 panel.setFrame(rect, display: true)
                 viewsByScreenID[id]?.frame = NSRect(origin: .zero, size: rect.size)
-                viewsByScreenID[id]?.fillColor = fill
                 panel.orderFrontRegardless()
                 continue
             }
-            let panel = NSPanel(contentRect: rect, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            let panel = NSPanel(
+                contentRect: rect,
+                styleMask: [.borderless, .nonactivatingPanel],
+                backing: .buffered,
+                defer: false
+            )
             panel.setFrame(rect, display: true)
             panel.isOpaque = false
             panel.backgroundColor = .clear
             panel.hasShadow = false
             panel.ignoresMouseEvents = true
-            panel.level = level
+            panel.level = windowLevel
             panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
             panel.isReleasedWhenClosed = false
             panel.hidesOnDeactivate = false
-            let view = TintView(frame: NSRect(origin: .zero, size: rect.size))
-            view.fillColor = fill
+            let view = MeterBarView(frame: NSRect(origin: .zero, size: rect.size))
             panel.contentView = view
             panelsByScreenID[id] = panel
             viewsByScreenID[id] = view
             panel.orderFrontRegardless()
         }
+        pushVisuals()
     }
 }
 
-private final class TintView: NSView {
-    var fillColor: NSColor = .clear { didSet { needsDisplay = true } }
-    override func draw(_ dirtyRect: NSRect) { fillColor.setFill(); bounds.fill() }
+/// Full-width background + centered red meter that expands with level.
+final class MeterBarView: NSView {
+    var backgroundFill: NSColor = .clear { didSet { needsDisplay = true } }
+    var meterFill: NSColor = NSColor.systemRed.withAlphaComponent(0.85) { didSet { needsDisplay = true } }
+    var showMeter = false { didSet { needsDisplay = true } }
+    var level: CGFloat = 0 { didSet { needsDisplay = true } }
+    var stubWidth: CGFloat = 32
+    var maxMeterFraction: CGFloat = 0.70
+    var levelCurve: CGFloat = 0.65
+
+    override func draw(_ dirtyRect: NSRect) {
+        backgroundFill.setFill()
+        bounds.fill()
+
+        guard showMeter else { return }
+        let barW = bounds.width
+        let maxW = barW * maxMeterFraction
+        let curved = pow(max(0, min(1, level)), levelCurve)
+        let meterW = min(maxW, stubWidth + (maxW - stubWidth) * curved)
+        let x = (barW - meterW) * 0.5
+        let meterRect = NSRect(x: x, y: 0, width: meterW, height: bounds.height)
+        meterFill.setFill()
+        meterRect.fill()
+    }
+
     override var acceptsFirstResponder: Bool { false }
 }
 
@@ -234,25 +285,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var pollTimer: Timer?
     private var activity: NSObjectProtocol?
+    private var lastMic = false
+    private var lastCam = false
+    private var lastLevelBucket = -1
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         ProcessInfo.processInfo.disableAutomaticTermination("live-tint")
         activity = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiatedAllowingIdleSystemSleep],
-            reason: "menu-bar mic/camera tint"
+            reason: "menu-bar mic/camera level tint"
         )
 
         MenuBarTintOverlay.shared.start()
-        MuteBridge.shared.onChange = { [weak self] in self?.refreshTint() }
-        MuteBridge.shared.start()
+        MicLevelMonitor.shared.onLevel = { [weak self] level in
+            MenuBarTintOverlay.shared.setLevel(CGFloat(level))
+            self?.updateStatusLevel(level)
+        }
 
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.title = "🎙"
-        item.button?.toolTip = "live-tint — mic orange / muted yellow / cam green"
+        item.button?.toolTip = "live-tint — orange=mic, green=cam, red=level"
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Flash test (orange)", action: #selector(flashTest), keyEquivalent: "t"))
-        menu.addItem(NSMenuItem(title: "Simulate muted (yellow)", action: #selector(flashMuted), keyEquivalent: "m"))
+        menu.addItem(NSMenuItem(title: "Flash test (orange + stub)", action: #selector(flashTest), keyEquivalent: "t"))
         menu.addItem(NSMenuItem(title: "Quit live-tint", action: #selector(quit), keyEquivalent: "q"))
         item.menu = menu
         statusItem = item
@@ -261,29 +316,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NotificationCenter.default.addObserver(self, selector: #selector(devDisconnected(_:)), name: AVCaptureDevice.wasDisconnectedNotification, object: nil)
 
         discover()
-        refreshTint()
+        refreshState()
 
-        // Listeners can miss transitions; poll as a safety net.
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            MuteBridge.shared.sweepStale()
-            self?.refreshTint()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
+            self?.refreshState()
         }
         if let pollTimer { RunLoop.main.add(pollTimer, forMode: .common) }
 
-        // Brief visible flash so you know the overlay is alive.
-        MenuBarTintOverlay.shared.apply(.orange)
+        // Brief sanity flash.
+        MenuBarTintOverlay.shared.apply(background: .orange, showMeter: true, level: 0)
         statusItem?.button?.title = "🟠"
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            self?.refreshTint()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            self?.refreshState()
         }
 
-        fputs("live-tint running — orange=live mic, yellow=muted (extension), green=cam.\n", stderr)
+        fputs("live-tint: orange=mic open, green=cam, red stub/expand=level\n", stderr)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         pollTimer?.invalidate()
         if let activity { ProcessInfo.processInfo.endActivity(activity) }
-        MuteBridge.shared.stop()
+        MicLevelMonitor.shared.setActive(false)
         MenuBarTintOverlay.shared.stop()
         monitors.values.forEach { $0.stopMonitoring() }
         monitors.removeAll()
@@ -292,18 +345,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func quit() { NSApp.terminate(nil) }
 
     @objc private func flashTest() {
-        MenuBarTintOverlay.shared.apply(.orange)
+        MenuBarTintOverlay.shared.apply(background: .orange, showMeter: true, level: 0)
         statusItem?.button?.title = "🟠"
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            self?.refreshTint()
-        }
-    }
-
-    @objc private func flashMuted() {
-        MenuBarTintOverlay.shared.apply(.muted)
-        statusItem?.button?.title = "🟡"
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            self?.refreshTint()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            self?.refreshState()
         }
     }
 
@@ -318,7 +363,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func monitor(_ device: AVCaptureDevice) {
         guard monitors[device.uniqueID] == nil else { return }
         guard let m = MonitoredDevice(device: device, onStateChange: { [weak self] _, _ in
-            self?.refreshTint()
+            self?.refreshState()
         }) else { return }
         monitors[device.uniqueID] = m
         m.startMonitoring()
@@ -326,55 +371,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func devConnected(_ note: Notification) {
-        if let d = note.object as? AVCaptureDevice { monitor(d); refreshTint() }
+        if let d = note.object as? AVCaptureDevice { monitor(d); refreshState() }
     }
 
     @objc private func devDisconnected(_ note: Notification) {
         if let d = note.object as? AVCaptureDevice {
             monitors[d.uniqueID]?.stopMonitoring()
             monitors.removeValue(forKey: d.uniqueID)
-            refreshTint()
+            refreshState()
         }
     }
 
-    private var lastReported: MenuBarTintColor = .off
-
-    private func refreshTint() {
+    private func refreshState() {
         var mic = false, cam = false
-        var activeNames: [String] = []
         for m in monitors.values where m.queryIsRunning() {
             if m.isVideo { cam = true } else { mic = true }
-            activeNames.append(m.device.localizedName)
         }
-        let next: MenuBarTintColor
+
+        MicLevelMonitor.shared.setActive(mic)
+
+        let bg: OverlayBackground
         if cam {
-            next = .green
-            statusItem?.button?.title = "🟢"
+            bg = .green
+            statusItem?.button?.title = mic ? "🟢🎙" : "🟢"
         } else if mic {
-            // In-app mute only when the extension (or simulator) says so.
-            if MuteBridge.shared.isMuted == true {
-                next = .muted
-                statusItem?.button?.title = "🟡"
-            } else {
-                next = .orange
-                statusItem?.button?.title = "🟠"
-            }
+            bg = .orange
+            statusItem?.button?.title = "🟠"
         } else {
-            next = .off
+            bg = .clear
             statusItem?.button?.title = "🎙"
         }
-        if next != lastReported {
-            lastReported = next
-            var line = "state=\(next)"
-            if !activeNames.isEmpty {
-                line += " devices=[\(activeNames.joined(separator: ", "))]"
-            }
-            if MuteBridge.shared.isMuted != nil {
-                line += " mute=\(MuteBridge.shared.isMuted!) src=\(MuteBridge.shared.source)"
-            }
-            fputs(line + "\n", stderr)
+
+        let level = CGFloat(MicLevelMonitor.shared.level)
+        MenuBarTintOverlay.shared.apply(background: bg, showMeter: mic, level: level)
+
+        if mic != lastMic || cam != lastCam {
+            lastMic = mic
+            lastCam = cam
+            fputs("state mic=\(mic) cam=\(cam)\n", stderr)
         }
-        MenuBarTintOverlay.shared.apply(next)
+    }
+
+    private func updateStatusLevel(_ level: Float) {
+        let bucket = Int(level * 10)
+        guard bucket != lastLevelBucket else { return }
+        lastLevelBucket = bucket
+        if lastMic {
+            fputs(String(format: "level=%.2f\n", level), stderr)
+        }
     }
 }
 

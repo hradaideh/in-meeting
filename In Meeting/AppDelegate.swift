@@ -166,12 +166,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setupObservers()
         discoverAndMonitorDevices()
         
-        // 6. Menu-bar tint overlay (click-through; mic→orange, muted→yellow, cam→green)
+        // 6. Menu-bar tint: orange/green bg + centered red level meter
         MenuBarTintOverlay.shared.start()
-        MuteBridge.shared.onChange = { [weak self] in
-            DispatchQueue.main.async { self?.updateMenuBarTint() }
+        MicLevelMonitor.shared.onLevel = { level in
+            MenuBarTintOverlay.shared.setLevel(CGFloat(level))
         }
-        MuteBridge.shared.start()
         
         // 7. Update visual icon state, status file, and tint
         updateMeetingStatus()
@@ -202,11 +201,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateMenuBarTint()
     }
 
-    /// Mic live → orange; mic muted (extension) → yellow; camera → green; idle/paused → off.
+    /// Camera → green bg; mic open → orange bg + red stub/expand from mic level; idle → clear.
     func updateMenuBarTint() {
-        MuteBridge.shared.sweepStale()
         guard !SettingsManager.shared.isPaused else {
-            MenuBarTintOverlay.shared.apply(.off)
+            MicLevelMonitor.shared.setActive(false)
+            MenuBarTintOverlay.shared.apply(background: .clear, showMeter: false, level: 0)
             return
         }
         var mic = false
@@ -222,17 +221,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 mic = true
             }
         }
+        MicLevelMonitor.shared.setActive(mic)
+        let bg: OverlayBackground
         if cam {
-            MenuBarTintOverlay.shared.apply(.green)
+            bg = .green
         } else if mic {
-            if MuteBridge.shared.isMuted == true {
-                MenuBarTintOverlay.shared.apply(.muted)
-            } else {
-                MenuBarTintOverlay.shared.apply(.orange)
-            }
+            bg = .orange
         } else {
-            MenuBarTintOverlay.shared.apply(.off)
+            bg = .clear
         }
+        MenuBarTintOverlay.shared.apply(
+            background: bg,
+            showMeter: mic,
+            level: CGFloat(MicLevelMonitor.shared.level)
+        )
     }
 
     func updateStatusItemIcon() {
@@ -379,7 +381,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ aNotification: Notification) {
-        MuteBridge.shared.stop()
+        MicLevelMonitor.shared.setActive(false)
         MenuBarTintOverlay.shared.stop()
         StatusFileManager.shared.cleanup()
         for monitor in activeMonitors.values {

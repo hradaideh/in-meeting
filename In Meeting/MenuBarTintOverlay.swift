@@ -1,29 +1,30 @@
 import AppKit
 import CoreGraphics
 
-/// Semi-transparent click-through strip over the menu bar.
-/// Height is **dynamic and per-screen**: `screen.frame.maxY - screen.visibleFrame.maxY`
-/// (the live menu-bar band macOS reserves). Re-measured on screen changes and on a short timer
-/// so auto-hide / fullscreen / resolution shifts track without a fixed drip.
-enum MenuBarTintColor {
-    case off
-    case orange // microphone live (unmuted / unknown)
-    case muted  // microphone held but meeting app muted
-    case green  // camera (or both)
+enum OverlayBackground {
+    case clear
+    case orange // mic open
+    case green  // camera on (wins backdrop)
 }
 
+/// Semi-transparent click-through strip over the menu bar.
+/// Height is dynamic per-screen (`frame.maxY - visibleFrame.maxY`).
+/// Layers: orange/green/clear background + centered red meter (stub when quiet, expands with level).
 final class MenuBarTintOverlay {
     static let shared = MenuBarTintOverlay()
 
-    var alpha: CGFloat = 0.45
-    var isEnabled: Bool = true {
-        didSet { apply(current) }
-    }
+    var backgroundAlpha: CGFloat = 0.40
+    var meterAlpha: CGFloat = 0.85
+    var stubWidth: CGFloat = 32
+    var maxMeterFraction: CGFloat = 0.70
+    var levelCurve: CGFloat = 0.65
 
     private var panelsByScreenID: [CGDirectDisplayID: NSPanel] = [:]
-    private var viewsByScreenID: [CGDirectDisplayID: TintView] = [:]
+    private var viewsByScreenID: [CGDirectDisplayID: MeterBarView] = [:]
     private var lastGeometryKey: String = ""
-    private var current: MenuBarTintColor = .off
+    private var background: OverlayBackground = .clear
+    private var showMeter = false
+    private var level: CGFloat = 0
     private var heightTimer: Timer?
     private var started = false
 
@@ -38,7 +39,6 @@ final class MenuBarTintOverlay {
             name: NSApplication.didChangeScreenParametersNotification,
             object: nil
         )
-        // visibleFrame often changes (menu bar auto-hide, fullscreen) without a screen-params ping.
         heightTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { [weak self] _ in
             self?.syncGeometryIfNeeded()
         }
@@ -51,7 +51,7 @@ final class MenuBarTintOverlay {
     func stop() {
         heightTimer?.invalidate()
         heightTimer = nil
-        apply(.off)
+        apply(background: .clear, showMeter: false, level: 0)
         panelsByScreenID.values.forEach { $0.orderOut(nil) }
         panelsByScreenID.removeAll()
         viewsByScreenID.removeAll()
@@ -59,24 +59,40 @@ final class MenuBarTintOverlay {
         started = false
     }
 
-    func apply(_ color: MenuBarTintColor) {
-        current = color
-        syncGeometryIfNeeded()
-        let fill = fillColor(for: color)
-        for view in viewsByScreenID.values {
-            view.fillColor = fill
-        }
-        // Keep panels fronted even when clear so the process isn't auto-terminated.
+    func apply(background: OverlayBackground, showMeter: Bool, level: CGFloat) {
+        self.background = background
+        self.showMeter = showMeter
+        self.level = max(0, min(1, level))
+        syncGeometryIfNeeded(force: panelsByScreenID.isEmpty)
+        pushVisuals()
         panelsByScreenID.values.forEach { $0.orderFrontRegardless() }
     }
 
-    private func fillColor(for color: MenuBarTintColor) -> NSColor {
-        guard isEnabled else { return .clear }
-        switch color {
-        case .off: return .clear
-        case .orange: return NSColor.systemOrange.withAlphaComponent(alpha)
-        case .muted: return NSColor.systemYellow.withAlphaComponent(min(alpha, 0.35))
-        case .green: return NSColor.systemGreen.withAlphaComponent(alpha)
+    func setLevel(_ level: CGFloat) {
+        self.level = max(0, min(1, level))
+        for view in viewsByScreenID.values {
+            view.level = self.level
+        }
+    }
+
+    private func pushVisuals() {
+        let bg = backgroundColor()
+        for view in viewsByScreenID.values {
+            view.backgroundFill = bg
+            view.showMeter = showMeter
+            view.level = level
+            view.stubWidth = stubWidth
+            view.maxMeterFraction = maxMeterFraction
+            view.levelCurve = levelCurve
+            view.meterFill = NSColor.systemRed.withAlphaComponent(meterAlpha)
+        }
+    }
+
+    private func backgroundColor() -> NSColor {
+        switch background {
+        case .clear: return .clear
+        case .orange: return NSColor.systemOrange.withAlphaComponent(backgroundAlpha)
+        case .green: return NSColor.systemGreen.withAlphaComponent(backgroundAlpha)
         }
     }
 
@@ -88,21 +104,14 @@ final class MenuBarTintOverlay {
         syncGeometryIfNeeded(force: true)
     }
 
-    /// Snapshot of per-screen menu-bar rectangles derived from AppKit's live layout.
-    private func currentMenuBarBands() -> [(CGDirectDisplayID, NSRect, CGFloat)] {
+    private func syncGeometryIfNeeded(force: Bool = false) {
         var bands: [(CGDirectDisplayID, NSRect, CGFloat)] = []
         for screen in NSScreen.screens {
             let frame = screen.frame
             let visible = screen.visibleFrame
-            // Per-screen menu bar height reserved by the system right now.
             let barHeight = frame.maxY - visible.maxY
-            guard barHeight > 0.5 else {
-                // No menu bar on this display (often secondary when "menu bar on main only",
-                // or temporarily hidden). Skip — do not invent a fake height.
-                continue
-            }
-            let displayID = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID
-                ?? 0
+            guard barHeight > 0.5 else { continue }
+            let displayID = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID ?? 0
             let rect = NSRect(
                 x: frame.minX,
                 y: frame.maxY - barHeight,
@@ -111,21 +120,13 @@ final class MenuBarTintOverlay {
             )
             bands.append((displayID, rect, barHeight))
         }
-        return bands
-    }
-
-    private func geometryKey(for bands: [(CGDirectDisplayID, NSRect, CGFloat)]) -> String {
-        bands
-            .map { id, rect, h in
-                String(format: "%u:%.1f,%.1f,%.1f,%.1f@%.1f", id, rect.minX, rect.minY, rect.width, rect.height, h)
-            }
-            .joined(separator: "|")
-    }
-
-    private func syncGeometryIfNeeded(force: Bool = false) {
-        let bands = currentMenuBarBands()
-        let key = geometryKey(for: bands)
-        guard force || key != lastGeometryKey else { return }
+        let key = bands.map { id, rect, h in
+            String(format: "%u:%.1f,%.1f,%.1f,%.1f@%.1f", id, rect.minX, rect.minY, rect.width, rect.height, h)
+        }.joined(separator: "|")
+        guard force || key != lastGeometryKey else {
+            pushVisuals()
+            return
+        }
         lastGeometryKey = key
 
         let activeIDs = Set(bands.map(\.0))
@@ -135,14 +136,10 @@ final class MenuBarTintOverlay {
             viewsByScreenID.removeValue(forKey: id)
         }
 
-        let fill = fillColor(for: current)
-        for (displayID, rect, barHeight) in bands {
-            fputs(String(format: "menubar screen=%u height=%.1f rect=%@\n", displayID, barHeight, NSStringFromRect(rect)), stderr)
-
+        for (displayID, rect, _) in bands {
             if let panel = panelsByScreenID[displayID] {
                 panel.setFrame(rect, display: true)
                 viewsByScreenID[displayID]?.frame = NSRect(origin: .zero, size: rect.size)
-                viewsByScreenID[displayID]?.fillColor = fill
                 panel.orderFrontRegardless()
                 continue
             }
@@ -168,24 +165,37 @@ final class MenuBarTintOverlay {
             panel.isReleasedWhenClosed = false
             panel.hidesOnDeactivate = false
 
-            let view = TintView(frame: NSRect(origin: .zero, size: rect.size))
-            view.fillColor = fill
+            let view = MeterBarView(frame: NSRect(origin: .zero, size: rect.size))
             panel.contentView = view
             panelsByScreenID[displayID] = panel
             viewsByScreenID[displayID] = view
             panel.orderFrontRegardless()
         }
+        pushVisuals()
     }
 }
 
-private final class TintView: NSView {
-    var fillColor: NSColor = .clear {
-        didSet { needsDisplay = true }
-    }
+final class MeterBarView: NSView {
+    var backgroundFill: NSColor = .clear { didSet { needsDisplay = true } }
+    var meterFill: NSColor = NSColor.systemRed.withAlphaComponent(0.85) { didSet { needsDisplay = true } }
+    var showMeter = false { didSet { needsDisplay = true } }
+    var level: CGFloat = 0 { didSet { needsDisplay = true } }
+    var stubWidth: CGFloat = 32
+    var maxMeterFraction: CGFloat = 0.70
+    var levelCurve: CGFloat = 0.65
 
     override func draw(_ dirtyRect: NSRect) {
-        fillColor.setFill()
+        backgroundFill.setFill()
         bounds.fill()
+        guard showMeter else { return }
+        let barW = bounds.width
+        let maxW = barW * maxMeterFraction
+        let curved = pow(max(0, min(1, level)), levelCurve)
+        let meterW = min(maxW, stubWidth + (maxW - stubWidth) * curved)
+        let x = (barW - meterW) * 0.5
+        let meterRect = NSRect(x: x, y: 0, width: meterW, height: bounds.height)
+        meterFill.setFill()
+        meterRect.fill()
     }
 
     override var acceptsFirstResponder: Bool { false }
