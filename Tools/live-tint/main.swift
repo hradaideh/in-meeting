@@ -10,59 +10,96 @@ import CoreGraphics
 
 enum MenuBarTintColor { case off, orange, green }
 
+/// Height is dynamic + per-screen: frame.maxY - visibleFrame.maxY (live menu-bar band).
 final class MenuBarTintOverlay {
     static let shared = MenuBarTintOverlay()
-    var dripBelowBar: CGFloat = 8
     var alpha: CGFloat = 0.45
-    private var panels: [NSPanel] = []
-    private var views: [TintView] = []
+    private var panelsByScreenID: [CGDirectDisplayID: NSPanel] = [:]
+    private var viewsByScreenID: [CGDirectDisplayID: TintView] = [:]
+    private var lastGeometryKey = ""
     private var current: MenuBarTintColor = .off
+    private var heightTimer: Timer?
 
     func start() {
         NotificationCenter.default.addObserver(
-            self, selector: #selector(rebuild),
+            self, selector: #selector(forceSync),
             name: NSApplication.didChangeScreenParametersNotification, object: nil
         )
-        rebuild()
+        heightTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { [weak self] _ in
+            self?.syncGeometryIfNeeded()
+        }
+        if let heightTimer { RunLoop.main.add(heightTimer, forMode: .common) }
+        syncGeometryIfNeeded(force: true)
     }
 
     func stop() {
+        heightTimer?.invalidate()
+        heightTimer = nil
         apply(.off)
-        panels.forEach { $0.orderOut(nil) }
-        panels.removeAll()
-        views.removeAll()
+        panelsByScreenID.values.forEach { $0.orderOut(nil) }
+        panelsByScreenID.removeAll()
+        viewsByScreenID.removeAll()
+        lastGeometryKey = ""
     }
 
     func apply(_ color: MenuBarTintColor) {
         current = color
-        if panels.isEmpty { rebuild() }
-        let fill: NSColor
-        switch color {
-        case .off: fill = .clear
-        case .orange: fill = NSColor.systemOrange.withAlphaComponent(alpha)
-        case .green: fill = NSColor.systemGreen.withAlphaComponent(alpha)
-        }
-        views.forEach { $0.fillColor = fill }
-        if color != .off { panels.forEach { $0.orderFrontRegardless() } }
+        syncGeometryIfNeeded()
+        let fill = fillColor(for: color)
+        viewsByScreenID.values.forEach { $0.fillColor = fill }
+        if color != .off { panelsByScreenID.values.forEach { $0.orderFrontRegardless() } }
         fputs("tint=\(color)\n", stderr)
+    }
+
+    private func fillColor(for color: MenuBarTintColor) -> NSColor {
+        switch color {
+        case .off: return .clear
+        case .orange: return NSColor.systemOrange.withAlphaComponent(alpha)
+        case .green: return NSColor.systemGreen.withAlphaComponent(alpha)
+        }
     }
 
     private var level: NSWindow.Level {
         NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.mainMenuWindow)) + 2)
     }
 
-    @objc private func rebuild() {
-        let prev = current
-        panels.forEach { $0.orderOut(nil) }
-        panels.removeAll()
-        views.removeAll()
+    @objc private func forceSync() { syncGeometryIfNeeded(force: true) }
+
+    private func syncGeometryIfNeeded(force: Bool = false) {
+        var bands: [(CGDirectDisplayID, NSRect, CGFloat)] = []
         for screen in NSScreen.screens {
             let frame = screen.frame
             let visible = screen.visibleFrame
-            var barH = frame.maxY - visible.maxY
-            if barH < 1 { barH = max(screen.safeAreaInsets.top, 28) }
-            let h = barH + dripBelowBar
-            let rect = NSRect(x: frame.minX, y: frame.maxY - h, width: frame.width, height: h)
+            let barH = frame.maxY - visible.maxY
+            // Per screen: only paint where macOS currently reserves a menu bar.
+            guard barH > 0.5 else { continue }
+            let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID ?? 0
+            let rect = NSRect(x: frame.minX, y: frame.maxY - barH, width: frame.width, height: barH)
+            bands.append((id, rect, barH))
+        }
+        let key = bands.map { id, r, h in
+            String(format: "%u:%.1f,%.1f,%.1fx%.1f", id, r.minX, r.minY, r.width, h)
+        }.joined(separator: "|")
+        guard force || key != lastGeometryKey else { return }
+        lastGeometryKey = key
+
+        let active = Set(bands.map(\.0))
+        for (id, panel) in panelsByScreenID where !active.contains(id) {
+            panel.orderOut(nil)
+            panelsByScreenID.removeValue(forKey: id)
+            viewsByScreenID.removeValue(forKey: id)
+        }
+
+        let fill = fillColor(for: current)
+        for (id, rect, barH) in bands {
+            fputs(String(format: "menubar screen=%u height=%.1f\n", id, barH), stderr)
+            if let panel = panelsByScreenID[id] {
+                panel.setFrame(rect, display: true)
+                viewsByScreenID[id]?.frame = NSRect(origin: .zero, size: rect.size)
+                viewsByScreenID[id]?.fillColor = fill
+                if current != .off { panel.orderFrontRegardless() }
+                continue
+            }
             let panel = NSPanel(contentRect: rect, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
             panel.setFrame(rect, display: true)
             panel.isOpaque = false
@@ -74,12 +111,12 @@ final class MenuBarTintOverlay {
             panel.isReleasedWhenClosed = false
             panel.hidesOnDeactivate = false
             let view = TintView(frame: NSRect(origin: .zero, size: rect.size))
+            view.fillColor = fill
             panel.contentView = view
-            panels.append(panel)
-            views.append(view)
-            panel.orderFrontRegardless()
+            panelsByScreenID[id] = panel
+            viewsByScreenID[id] = view
+            if current != .off { panel.orderFrontRegardless() }
         }
-        apply(prev)
     }
 }
 
