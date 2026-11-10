@@ -44,10 +44,12 @@ final class MenuBarTintOverlay {
 
     func apply(_ color: MenuBarTintColor) {
         current = color
-        syncGeometryIfNeeded()
+        syncGeometryIfNeeded(force: panelsByScreenID.isEmpty)
         let fill = fillColor(for: color)
         viewsByScreenID.values.forEach { $0.fillColor = fill }
-        if color != .off { panelsByScreenID.values.forEach { $0.orderFrontRegardless() } }
+        // Always keep panels ordered front (even when clear) so AppKit doesn't
+        // auto-terminate the accessory process for "no windows open".
+        panelsByScreenID.values.forEach { $0.orderFrontRegardless() }
         fputs("tint=\(color)\n", stderr)
     }
 
@@ -97,7 +99,7 @@ final class MenuBarTintOverlay {
                 panel.setFrame(rect, display: true)
                 viewsByScreenID[id]?.frame = NSRect(origin: .zero, size: rect.size)
                 viewsByScreenID[id]?.fillColor = fill
-                if current != .off { panel.orderFrontRegardless() }
+                panel.orderFrontRegardless()
                 continue
             }
             let panel = NSPanel(contentRect: rect, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
@@ -115,7 +117,7 @@ final class MenuBarTintOverlay {
             panel.contentView = view
             panelsByScreenID[id] = panel
             viewsByScreenID[id] = view
-            if current != .off { panel.orderFrontRegardless() }
+            panel.orderFrontRegardless()
         }
     }
 }
@@ -219,15 +221,24 @@ final class MonitoredDevice {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var monitors: [String: MonitoredDevice] = [:]
     private var statusItem: NSStatusItem?
+    private var pollTimer: Timer?
+    private var activity: NSObjectProtocol?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        ProcessInfo.processInfo.disableAutomaticTermination("live-tint")
+        activity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep],
+            reason: "menu-bar mic/camera tint"
+        )
+
         MenuBarTintOverlay.shared.start()
 
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.title = "🎙"
-        item.button?.toolTip = "live-tint — mic→orange, cam→green (q to quit via menu)"
+        item.button?.toolTip = "live-tint — mic→orange, cam→green"
         let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "Flash test (orange)", action: #selector(flashTest), keyEquivalent: "t"))
         menu.addItem(NSMenuItem(title: "Quit live-tint", action: #selector(quit), keyEquivalent: "q"))
         item.menu = menu
         statusItem = item
@@ -237,16 +248,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         discover()
         refreshTint()
-        fputs("live-tint running — open a call / QuickTime to test. Menu → Quit.\n", stderr)
+
+        // Listeners can miss transitions; poll as a safety net.
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.refreshTint()
+        }
+        if let pollTimer { RunLoop.main.add(pollTimer, forMode: .common) }
+
+        // Brief visible flash so you know the overlay is alive.
+        MenuBarTintOverlay.shared.apply(.orange)
+        statusItem?.button?.title = "🟠"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.refreshTint()
+        }
+
+        fputs("live-tint running — flash orange 1.5s, then mic/cam. Menu: Flash test / Quit.\n", stderr)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        pollTimer?.invalidate()
+        if let activity { ProcessInfo.processInfo.endActivity(activity) }
         MenuBarTintOverlay.shared.stop()
         monitors.values.forEach { $0.stopMonitoring() }
         monitors.removeAll()
     }
 
     @objc private func quit() { NSApp.terminate(nil) }
+
+    @objc private func flashTest() {
+        MenuBarTintOverlay.shared.apply(.orange)
+        statusItem?.button?.title = "🟠"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.refreshTint()
+        }
+    }
 
     private func discover() {
         let audio = AVCaptureDevice.DiscoverySession(deviceTypes: [.microphone, .external], mediaType: .audio, position: .unspecified)
@@ -278,21 +313,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private var lastReported: MenuBarTintColor = .off
+
     private func refreshTint() {
         var mic = false, cam = false
+        var activeNames: [String] = []
         for m in monitors.values where m.queryIsRunning() {
             if m.isVideo { cam = true } else { mic = true }
+            activeNames.append(m.device.localizedName)
         }
+        let next: MenuBarTintColor
         if cam {
-            MenuBarTintOverlay.shared.apply(.green)
+            next = .green
             statusItem?.button?.title = "🟢"
         } else if mic {
-            MenuBarTintOverlay.shared.apply(.orange)
+            next = .orange
             statusItem?.button?.title = "🟠"
         } else {
-            MenuBarTintOverlay.shared.apply(.off)
+            next = .off
             statusItem?.button?.title = "🎙"
         }
+        if next != lastReported {
+            lastReported = next
+            if !activeNames.isEmpty {
+                fputs("active: \(activeNames.joined(separator: ", "))\n", stderr)
+            }
+        }
+        MenuBarTintOverlay.shared.apply(next)
     }
 }
 

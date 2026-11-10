@@ -65,9 +65,8 @@ final class MenuBarTintOverlay {
         for view in viewsByScreenID.values {
             view.fillColor = fill
         }
-        if color != .off && isEnabled {
-            panelsByScreenID.values.forEach { $0.orderFrontRegardless() }
-        }
+        // Keep panels fronted even when clear so the process isn't auto-terminated.
+        panelsByScreenID.values.forEach { $0.orderFrontRegardless() }
     }
 
     private func fillColor(for color: MenuBarTintColor) -> NSColor {
@@ -142,9 +141,7 @@ final class MenuBarTintOverlay {
                 panel.setFrame(rect, display: true)
                 viewsByScreenID[displayID]?.frame = NSRect(origin: .zero, size: rect.size)
                 viewsByScreenID[displayID]?.fillColor = fill
-                if current != .off && isEnabled {
-                    panel.orderFrontRegardless()
-                }
+                panel.orderFrontRegardless()
                 continue
             }
 
@@ -174,9 +171,7 @@ final class MenuBarTintOverlay {
             panel.contentView = view
             panelsByScreenID[displayID] = panel
             viewsByScreenID[displayID] = view
-            if current != .off && isEnabled {
-                panel.orderFrontRegardless()
-            }
+            panel.orderFrontRegardless()
         }
     }
 }
