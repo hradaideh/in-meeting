@@ -14,6 +14,20 @@ brew install fellowgeek/tap/in-meeting
 
 > Looking to build from source with Xcode? See [How to Build and Run](#how-to-build-and-run).
 
+### This fork (hradaideh)
+
+Adds a **semi-transparent click-through menu-bar tint**: mic → orange, camera (or both) → green, idle → clear. Overlay level is `mainMenuWindow + 2` (required on macOS 26+/opaque menu chrome). Keep the MIT copyright notice when redistributing.
+
+**Try without Xcode** (detection + tint only):
+
+```bash
+cd Tools/live-tint
+swiftc -O -framework AppKit -framework AVFoundation -framework CoreAudio -framework CoreMediaIO -framework CoreGraphics -o live-tint main.swift
+./live-tint
+```
+
+Quit from the `🎙` status item menu. Full app still needs Xcode to build `In Meeting.xcodeproj`.
+
 ---
 
 ## Key Features

@@ -166,7 +166,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setupObservers()
         discoverAndMonitorDevices()
         
-        // 6. Update visual icon state and status file
+        // 6. Menu-bar tint overlay (click-through; mic→orange, cam→green)
+        MenuBarTintOverlay.shared.start()
+        
+        // 7. Update visual icon state, status file, and tint
         updateMeetingStatus()
     }
 
@@ -187,11 +190,40 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Updates both the local status file indicator (~/.in-meeting) and the menu bar icon.
+    /// Updates status file, menu bar icon, and menu-bar tint overlay.
     func updateMeetingStatus() {
         let hasActiveDevices = hasActiveMonitoredDevices
         StatusFileManager.shared.updateStatus(isActive: hasActiveDevices)
         updateStatusItemIcon()
+        updateMenuBarTint()
+    }
+
+    /// Mic only → orange; camera (or both) → green; idle/paused → off.
+    func updateMenuBarTint() {
+        guard !SettingsManager.shared.isPaused else {
+            MenuBarTintOverlay.shared.apply(.off)
+            return
+        }
+        var mic = false
+        var cam = false
+        for monitor in activeMonitors.values {
+            if SettingsManager.shared.excludedDeviceIDs.contains(monitor.device.uniqueID) {
+                continue
+            }
+            guard monitor.queryIsRunning() else { continue }
+            if monitor.isVideo {
+                cam = true
+            } else {
+                mic = true
+            }
+        }
+        if cam {
+            MenuBarTintOverlay.shared.apply(.green)
+        } else if mic {
+            MenuBarTintOverlay.shared.apply(.orange)
+        } else {
+            MenuBarTintOverlay.shared.apply(.off)
+        }
     }
 
     func updateStatusItemIcon() {
@@ -338,6 +370,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ aNotification: Notification) {
+        MenuBarTintOverlay.shared.stop()
         StatusFileManager.shared.cleanup()
         for monitor in activeMonitors.values {
             monitor.stopMonitoring()
